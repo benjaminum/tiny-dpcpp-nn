@@ -65,7 +65,10 @@ class _module_function(torch.autograd.Function):
             output = native_tcnn_module.inference(input.to(params.dtype))
         else:
             output = native_tcnn_module.fwd(input.to(params.dtype))
-        output = output.reshape(batch_size, -1).to(input.device)
+        if batch_size > 0:
+            output = output.reshape(batch_size, -1).to(input.device)
+        else: # keep shape if we have an empty input tensor with batch_size==0
+            output = output.to(input.device)
         ctx.save_for_backward(input, output, params)
         ctx.info = info
         ctx.native_tcnn_module = native_tcnn_module
