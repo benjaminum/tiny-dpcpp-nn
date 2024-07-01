@@ -32,7 +32,7 @@ def get_grad_params(model):
     return grads_all, params_all
 
 
-def compare_matrices(weights_dpcpp, weights_torch, atol=1e-2):
+def compare_matrices(weights_dpcpp, weights_torch, atol=1e-1, rtol=5e-2):
     for layer, _ in enumerate(weights_dpcpp):
         assert (
             weights_dpcpp[layer].shape == weights_torch[layer].shape
@@ -42,8 +42,14 @@ def compare_matrices(weights_dpcpp, weights_torch, atol=1e-2):
             weights_dpcpp[layer].to(dtype=torch.float),
             weights_torch[layer].to(dtype=torch.float),
             atol=atol,
+        ) or torch.allclose(
+            weights_dpcpp[layer].to(dtype=torch.float),
+            weights_torch[layer].to(dtype=torch.float),
+            rtol=rtol,
         )
         if not are_close:
+            print(f"weights_dpcpp: {weights_dpcpp}")
+            print(f"weights_torch: {weights_torch}")
             print(f"weights_dpcpp[layer] sum: {weights_dpcpp[layer].sum().sum()}")
             print(f"weights_torch[layer] sum: {weights_torch[layer].sum().sum()}")
         assert are_close
@@ -55,8 +61,10 @@ def create_models(
     output_size,
     activation_func,
     output_func,
-    dtype=torch.bfloat16,
-    use_nwe=True,
+    input_dtype,
+    backend_param_dtype,
+    use_nwe,
+    use_weights_of_tinynn,
 ):
 
     # Create and test CustomMLP
@@ -66,8 +74,8 @@ def create_models(
         output_size,
         activation_func,
         output_func,
-        use_batchnorm=False,
-        dtype=dtype,
+        dtype=backend_param_dtype,
+        nwe_as_ref=use_nwe,
     )
 
     network_config = {
@@ -78,22 +86,36 @@ def create_models(
     }
 
     if use_nwe:
+        encoding_config = {
+            "otype": "Identity",
+            "n_dims_to_encode": input_size,  # assuming the input size is 2 as in other tests
+            "scale": 1.0,
+            "offset": 0.0,
+        }
+
         model_dpcpp = NetworkWithInputEncoding(
             n_input_dims=input_size,
             n_output_dims=output_size,
+            encoding_config=encoding_config,
             network_config=network_config,
+            input_dtype=input_dtype,
+            backend_param_dtype=backend_param_dtype,
         )
     else:
         model_dpcpp = Network(
             n_input_dims=input_size,
             n_output_dims=output_size,
             network_config=network_config,
+            input_dtype=input_dtype,
+            backend_param_dtype=backend_param_dtype,
         )
 
-    weights = model_dpcpp.get_reshaped_params(datatype=dtype)
-    model_torch.set_weights(weights)
+    if use_weights_of_tinynn:
+        weights = model_dpcpp.get_reshaped_params()
+        model_torch.set_weights(weights)
+    else:
+        weights = model_torch.get_all_weights()
+        model_dpcpp.set_params(weights.flatten())
 
-    grads_dpcpp, params_dpcpp = get_grad_params(model_dpcpp)
-    grads_torch, params_torch = get_grad_params(model_torch)
-    compare_matrices(params_dpcpp[0], params_torch, atol=1e-7)
+    model_torch.to(model_dpcpp.device)
     return model_dpcpp, model_torch

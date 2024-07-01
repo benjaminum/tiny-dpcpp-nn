@@ -51,6 +51,12 @@ class PybindingModule {
 
     torch::Tensor initial_params(torch::Tensor &tensor) { return m_module->initialize_params(tensor); }
 
+    void set_params(torch::Tensor &tensor, bool weights_are_packed) {
+        m_module->set_params(tensor, weights_are_packed);
+    }
+
+    torch::Tensor get_params() { return m_module->get_params(); }
+
     uint32_t n_params() const { return (uint32_t)m_module->n_params(); }
     uint32_t n_output_dims() const { return m_module->n_output_dims(); }
 
@@ -67,21 +73,41 @@ PybindingModule create_network_module(int input_width, int output_width, int n_h
 }
 
 PybindingModule create_network_factory(int input_width, int output_width, int n_hidden_layers, Activation activation,
-                                       Activation output_activation, int width) {
-    if (width == 16) {
-        return create_network_module<bf16, 16>(input_width, output_width, n_hidden_layers, activation,
-                                               output_activation);
-    } else if (width == 32) {
-        return create_network_module<bf16, 32>(input_width, output_width, n_hidden_layers, activation,
-                                               output_activation);
-    } else if (width == 64) {
-        return create_network_module<bf16, 64>(input_width, output_width, n_hidden_layers, activation,
-                                               output_activation);
-    } else if (width == 128) {
-        return create_network_module<bf16, 128>(input_width, output_width, n_hidden_layers, activation,
-                                                output_activation);
+                                       Activation output_activation, int width, std::string dtype) {
+    if (dtype == "torch.float16") {
+        if (width == 16) {
+            return create_network_module<sycl::half, 16>(input_width, output_width, n_hidden_layers, activation,
+                                                         output_activation);
+        } else if (width == 32) {
+            return create_network_module<sycl::half, 32>(input_width, output_width, n_hidden_layers, activation,
+                                                         output_activation);
+        } else if (width == 64) {
+            return create_network_module<sycl::half, 64>(input_width, output_width, n_hidden_layers, activation,
+                                                         output_activation);
+        } else if (width == 128) {
+            return create_network_module<sycl::half, 128>(input_width, output_width, n_hidden_layers, activation,
+                                                          output_activation);
+        } else {
+            throw std::runtime_error("Unsupported width.");
+        }
+    } else if (dtype == "torch.bfloat16") {
+        if (width == 16) {
+            return create_network_module<bf16, 16>(input_width, output_width, n_hidden_layers, activation,
+                                                   output_activation);
+        } else if (width == 32) {
+            return create_network_module<bf16, 32>(input_width, output_width, n_hidden_layers, activation,
+                                                   output_activation);
+        } else if (width == 64) {
+            return create_network_module<bf16, 64>(input_width, output_width, n_hidden_layers, activation,
+                                                   output_activation);
+        } else if (width == 128) {
+            return create_network_module<bf16, 128>(input_width, output_width, n_hidden_layers, activation,
+                                                    output_activation);
+        } else {
+            throw std::runtime_error("Unsupported width.");
+        }
     } else {
-        throw std::runtime_error("Unsupported width.");
+        throw std::runtime_error("Unsupported dtype: " + dtype + ". Only fp16 and bf16 are supported");
     }
 }
 template <typename T> PybindingModule create_encoding_module(std::string encoding_name, const json &encoding_config) {
@@ -102,23 +128,45 @@ PybindingModule create_networkwithencoding_module(int input_width, int output_wi
 // C++ factory function
 PybindingModule create_networkwithencoding_factory(int input_width, int output_width, int n_hidden_layers,
                                                    Activation activation, Activation output_activation,
-                                                   const json &encoding_config, int width) {
-    if (width == 16) {
-        return create_networkwithencoding_module<float, bf16, 16>(input_width, output_width, n_hidden_layers,
-                                                                  activation, output_activation, encoding_config);
-    } else if (width == 32) {
-        return create_networkwithencoding_module<float, bf16, 32>(input_width, output_width, n_hidden_layers,
-                                                                  activation, output_activation, encoding_config);
-    } else if (width == 64) {
-        return create_networkwithencoding_module<float, bf16, 64>(input_width, output_width, n_hidden_layers,
-                                                                  activation, output_activation, encoding_config);
-    } else if (width == 128) {
-        return create_networkwithencoding_module<float, bf16, 128>(input_width, output_width, n_hidden_layers,
-                                                                   activation, output_activation, encoding_config);
+                                                   const json &encoding_config, int width, std::string dtype) {
+
+    if (dtype == "torch.float16") {
+        if (width == 16) {
+            return create_networkwithencoding_module<float, sycl::half, 16>(
+                input_width, output_width, n_hidden_layers, activation, output_activation, encoding_config);
+        } else if (width == 32) {
+            return create_networkwithencoding_module<float, sycl::half, 32>(
+                input_width, output_width, n_hidden_layers, activation, output_activation, encoding_config);
+        } else if (width == 64) {
+            return create_networkwithencoding_module<float, sycl::half, 64>(
+                input_width, output_width, n_hidden_layers, activation, output_activation, encoding_config);
+        } else if (width == 128) {
+            return create_networkwithencoding_module<float, sycl::half, 128>(
+                input_width, output_width, n_hidden_layers, activation, output_activation, encoding_config);
+        } else {
+            throw std::runtime_error("Unsupported width.");
+        }
+    } else if (dtype == "torch.bfloat16") {
+        if (width == 16) {
+            return create_networkwithencoding_module<float, bf16, 16>(input_width, output_width, n_hidden_layers,
+                                                                      activation, output_activation, encoding_config);
+        } else if (width == 32) {
+            return create_networkwithencoding_module<float, bf16, 32>(input_width, output_width, n_hidden_layers,
+                                                                      activation, output_activation, encoding_config);
+        } else if (width == 64) {
+            return create_networkwithencoding_module<float, bf16, 64>(input_width, output_width, n_hidden_layers,
+                                                                      activation, output_activation, encoding_config);
+        } else if (width == 128) {
+            return create_networkwithencoding_module<float, bf16, 128>(input_width, output_width, n_hidden_layers,
+                                                                       activation, output_activation, encoding_config);
+        } else {
+            throw std::runtime_error("Unsupported width.");
+        }
     } else {
-        throw std::runtime_error("Unsupported width.");
+        throw std::runtime_error("Unsupported dtype: " + dtype + ". Only fp16 and bf16 are supported");
     }
 }
+
 PYBIND11_MODULE(tiny_dpcpp_nn_pybind_module, m) {
     pybind11::enum_<Activation>(m, "Activation")
         .value("ReLU", Activation::ReLU)
@@ -139,13 +187,16 @@ PYBIND11_MODULE(tiny_dpcpp_nn_pybind_module, m) {
         .def("bwd_with_encoding_grad", &PybindingModule::bwd_with_encoding_grad)
         .def("initial_params", pybind11::overload_cast<>(&PybindingModule::initial_params))
         .def("initial_params", pybind11::overload_cast<torch::Tensor &>(&PybindingModule::initial_params))
+        .def("set_params", &PybindingModule::set_params)
+        .def("get_params", &PybindingModule::get_params)
         .def("n_output_dims", &PybindingModule::n_output_dims)
         .def("n_params", &PybindingModule::n_params);
     m.def("create_network", &create_network_factory, pybind11::arg("input_width"), pybind11::arg("output_width"),
           pybind11::arg("n_hidden_layers"), pybind11::arg("activation"), pybind11::arg("output_activation"),
-          pybind11::arg("width"));
-    m.def("create_encoding", &create_encoding_module<float>);
+          pybind11::arg("width"), pybind11::arg("dtype"));
+    m.def("create_encoding", &create_encoding_module<float>); /// TODO: add a factory here later
     m.def("create_networkwithencoding", &create_networkwithencoding_factory, pybind11::arg("input_width"),
           pybind11::arg("output_width"), pybind11::arg("n_hidden_layers"), pybind11::arg("activation"),
-          pybind11::arg("output_activation"), pybind11::arg("encoding_config"), pybind11::arg("width"));
+          pybind11::arg("output_activation"), pybind11::arg("encoding_config"), pybind11::arg("width"),
+          pybind11::arg("dtype"));
 }

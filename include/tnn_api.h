@@ -61,6 +61,8 @@ class Module {
 
     virtual torch::Tensor initialize_params() = 0;
     virtual torch::Tensor initialize_params(torch::Tensor &tensor) = 0;
+    virtual void set_params(torch::Tensor &tensor, bool weights_are_packed) = 0;
+    virtual torch::Tensor get_params() = 0;
     virtual torch::Tensor forward_pass(torch::Tensor input_tensor) = 0;
     virtual std::tuple<torch::Tensor, torch::Tensor>
     backward_pass(torch::Tensor input_tensor, torch::Tensor input_from_fwd, bool pack_gradient, bool get_dl_dinput) = 0;
@@ -236,27 +238,22 @@ class Module {
 
     template <> struct torch_type<int> {
         static const auto dtype = torch::kInt32;
-        typedef int type;
     };
 
     template <> struct torch_type<double> {
         static const auto dtype = torch::kFloat64;
-        typedef double type;
     };
 
     template <> struct torch_type<float> {
         static const auto dtype = torch::kFloat32;
-        typedef float type;
     };
 
     template <> struct torch_type<fp16> {
         static const auto dtype = c10::ScalarType::Half;
-        typedef at::Half type;
     };
 
     template <> struct torch_type<bf16> {
         static const auto dtype = c10::ScalarType::BFloat16;
-        typedef at::BFloat16 type;
     };
 
   private:
@@ -298,15 +295,13 @@ template <typename T> class EncodingModule : public Module {
         std::unique_ptr<Context> model_ctx = encoding_->forward_impl(&this->sycl_queue_, input_dmv, &output_encoding);
         this->sycl_queue_.wait();
 
-        return xpu::dpcpp::fromUSM(reinterpret_cast<torch_type<T>::type *>(output_encoding.GetPointer()),
-                                   torch_type<T>::dtype,
+        return xpu::dpcpp::fromUSM((output_encoding.GetPointer()), torch_type<T>::dtype,
                                    {static_cast<long>(batch_size), static_cast<long>(encoding_->output_width())});
     }
 
     torch::Tensor inference(torch::Tensor input_tensor) override { return forward_pass(input_tensor); }
 
     std::tuple<torch::Tensor, torch::Tensor> backward_pass(torch::Tensor grad_output, bool pack_gradient = false,
-
                                                            bool get_dl_dinput = false) override {
         throw std::runtime_error("backward_pass needs input_from_fwd");
     }
@@ -352,19 +347,28 @@ template <typename T> class EncodingModule : public Module {
         return {torch::Tensor(), convertDeviceMatrixToTorchTensor(*gradients_)};
     }
 
-    torch::Tensor initialize_params() override {
+    torch::Tensor initialize_params() override { return get_params(); }
+
+    torch::Tensor initialize_params(torch::Tensor &tensor) override {
+        if (params_full_precision_ptr_ != nullptr) {
+            set_params(tensor, false);
+        }
+        return initialize_params();
+    }
+
+    void set_params(torch::Tensor &params, bool weights_are_packed) override {
+        if (params_full_precision_ptr_ == nullptr) {
+            throw std::runtime_error("params_full_precision_ptr was not set");
+        }
+        params_full_precision_ptr_->copy_from_device(params.data_ptr<T>());
+    }
+
+    torch::Tensor get_params() override {
         if (params_full_precision_ptr_ != nullptr) {
             return convertDeviceMatrixToTorchTensor<T>(*params_full_precision_ptr_);
         } else {
             return torch::empty({0});
         }
-    }
-
-    torch::Tensor initialize_params(torch::Tensor &tensor) override {
-        if (params_full_precision_ptr_ != nullptr) {
-            params_full_precision_ptr_->copy_from_device(tensor.data_ptr<T>());
-        }
-        return initialize_params();
     }
 
     size_t n_params() override { return encoding_->n_params(); }
@@ -437,7 +441,7 @@ template <typename T, int WIDTH> class NetworkModule : public Module {
         DeviceMatricesView<T> output_network(1, batch_size, network_.get_output_width(), 0, 0, 0, 0, interm_forw_ptr_);
         network_.inference(input_dm, output_network, {});
         this->sycl_queue_.wait();
-        return xpu::dpcpp::fromUSM(reinterpret_cast<torch_type<T>::type *>(interm_forw_ptr_), torch_type<T>::dtype,
+        return xpu::dpcpp::fromUSM((interm_forw_ptr_), torch_type<T>::dtype,
                                    {static_cast<long>(batch_size), static_cast<long>(network_.get_output_width())});
     }
 
@@ -454,8 +458,7 @@ template <typename T, int WIDTH> class NetworkModule : public Module {
                                              network_.get_output_width(), interm_forw_ptr_);
         network_.forward_pass(input_dm, output_network, {});
         this->sycl_queue_.wait();
-        return xpu::dpcpp::fromUSM(reinterpret_cast<torch_type<T>::type *>(
-                                       output_network.GetMatrixPointer(network_.get_n_hidden_layers() + 1)),
+        return xpu::dpcpp::fromUSM((output_network.GetMatrixPointer(network_.get_n_hidden_layers() + 1)),
                                    torch_type<T>::dtype,
                                    {static_cast<long>(batch_size), static_cast<long>(network_.get_output_width())});
     }
@@ -476,6 +479,8 @@ template <typename T, int WIDTH> class NetworkModule : public Module {
                                         " is not equal to  get_padded_output_width" +
                                         std::to_string(network_.get_output_width()));
         }
+
+        // std::cout << "Torch grad_output: " << grad_output << std::endl;
 
         DeviceMatrixView<T> dL_doutput(batch_size, network_.get_output_width(), network_.get_output_width(),
                                        reinterpret_cast<T *>(grad_output.data_ptr()));
@@ -503,32 +508,30 @@ template <typename T, int WIDTH> class NetworkModule : public Module {
 
         torch::Tensor input_grad;
         if (get_dl_dinput) {
-            input_grad = xpu::dpcpp::fromUSM(reinterpret_cast<torch_type<T>::type *>(dL_dinput->GetPointer()),
-                                             torch_type<T>::dtype,
+            input_grad = xpu::dpcpp::fromUSM((dL_dinput->GetPointer()), torch_type<T>::dtype,
                                              {static_cast<long>(dL_dinput->nelements()), static_cast<long>(1)});
             delete dL_dinput; // delete only the view (underlying pointer still managed by Module class)
             dL_dinput = nullptr;
         }
 
-        return {input_grad,
-                xpu::dpcpp::fromUSM(
-                    reinterpret_cast<torch_type<T>::type *>(net_gradients_.GetViews().GetMatrixPointer(0)),
-                    torch_type<T>::dtype, {static_cast<long>(net_gradients_.nelements()), static_cast<long>(1)})};
+        return {input_grad, xpu::dpcpp::fromUSM((net_gradients_.GetViews().GetMatrixPointer(0)), torch_type<T>::dtype,
+                                                {static_cast<long>(net_gradients_.nelements()), static_cast<long>(1)})};
     }
 
-    torch::Tensor initialize_params() override {
-        return convertDeviceMatricesToTorchTensor(network_.get_weights_matrices());
-    }
+    torch::Tensor initialize_params() override { return get_params(); }
 
+    torch::Tensor get_params() override { return convertDeviceMatricesToTorchTensor(network_.get_weights_matrices()); }
     torch::Tensor initialize_params(torch::Tensor &tensor) override {
-        set_params(tensor);
+        set_params(tensor, false);
         return initialize_params();
     }
 
     size_t n_params() override { return network_.get_weights_matrices().nelements(); }
     size_t n_output_dims() override { return network_.get_output_width(); }
 
-    void set_params(torch::Tensor &params) { network_.set_weights_matrices(convertTensorToVector<T>(params)); }
+    void set_params(torch::Tensor &params, bool weights_are_packed) override {
+        network_.set_weights_matrices(convertTensorToVector<T>(params), weights_are_packed);
+    }
 
     std::vector<T> get_network_params() { return network_.get_weights_matrices().copy_to_host(); }
     std::vector<T> get_network_grads() { return net_gradients_.copy_to_host(); }
@@ -561,6 +564,27 @@ template <typename T, int WIDTH> class NetworkModule : public Module {
         sycl::free(dL_dinput_ptr_, this->sycl_queue_);
         dL_dinput_ptr_ = nullptr;
         max_batch_size_ = 0;
+    }
+
+    void printDeviceMatrix(const DeviceMatricesView<T> &device_matrices_view, int line_break_every) {
+        // Calculate the total number of elements to copy from the device memory
+        size_t total_elements = device_matrices_view.nelements();
+
+        // Create a host vector to store the copied data
+        std::vector<T> host_vector(total_elements);
+
+        // Copy the data from the device to the host vector
+        this->sycl_queue_
+            .memcpy(host_vector.data(), device_matrices_view.GetMatrixPointer(0), total_elements * sizeof(T))
+            .wait();
+
+        // Print the contents of the vector
+        for (size_t i = 0; i < total_elements; ++i) {
+            std::cout << host_vector[i] << ", ";
+            // Add a newline for better readability, you can adjust the number based on expected dimensions for
+            // visualization
+            if ((i + 1) % line_break_every == 0) std::cout << "========================" << std::endl;
+        }
     }
 
   private:
@@ -644,7 +668,7 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
         this->sycl_queue_.wait();
 
         return xpu::dpcpp::fromUSM(
-            reinterpret_cast<torch_type<T_net>::type *>(interm_forw_ptr_), torch_type<T_net>::dtype,
+            (interm_forw_ptr_), torch_type<T_net>::dtype,
             {static_cast<long>(batch_size), static_cast<long>(network_->get_network()->get_output_width())});
     }
 
@@ -671,8 +695,7 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
         this->sycl_queue_.wait();
 
         return xpu::dpcpp::fromUSM(
-            reinterpret_cast<torch_type<T_net>::type *>(
-                output_network.GetMatrixPointer(network_->get_network()->get_n_hidden_layers() + 1)),
+            (output_network.GetMatrixPointer(network_->get_network()->get_n_hidden_layers() + 1)),
             torch_type<T_net>::dtype,
             {static_cast<long>(batch_size), static_cast<long>(network_->get_network()->get_output_width())});
     }
@@ -711,9 +734,8 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
             net_gradients_->Packed(*net_gradients_.get());
         }
         return {torch::Tensor(),
-                xpu::dpcpp::fromUSM(
-                    reinterpret_cast<torch_type<T_net>::type *>(net_gradients_->GetViews().GetMatrixPointer(0)),
-                    torch_type<T_net>::dtype, {static_cast<long>(net_gradients_->nelements()), static_cast<long>(1)})};
+                xpu::dpcpp::fromUSM((net_gradients_->GetViews().GetMatrixPointer(0)), torch_type<T_net>::dtype,
+                                    {static_cast<long>(net_gradients_->nelements()), static_cast<long>(1)})};
     }
 
     std::tuple<torch::Tensor, torch::Tensor> backward_pass(torch::Tensor grad_output, torch::Tensor input_from_fwd,
@@ -762,12 +784,13 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
         CopyToDeviceMem(net_gradients_->GetViews(), enc_gradients_->GetView(), *all_gradients_.get(),
                         this->sycl_queue_);
         return {torch::Tensor(),
-                xpu::dpcpp::fromUSM(reinterpret_cast<torch_type<T_enc>::type *>(all_gradients_->data()),
-                                    torch_type<T_enc>::dtype,
+                xpu::dpcpp::fromUSM((all_gradients_->data()), torch_type<T_enc>::dtype,
                                     {static_cast<long>(all_gradients_->size()), static_cast<long>(1)})};
     }
 
-    torch::Tensor initialize_params() override {
+    torch::Tensor initialize_params() override { return get_params(); }
+
+    torch::Tensor get_params() override {
         if (params_full_precision_ptr_ == nullptr) {
             all_params_ = std::make_unique<DeviceMem<T_enc>>(
                 network_->get_network()->get_weights_matrices().nelements(), this->sycl_queue_);
@@ -782,26 +805,25 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
         }
         return convertDeviceMemToTorchTensor(*all_params_);
     }
-
     torch::Tensor initialize_params(torch::Tensor &tensor) override {
-        set_params(tensor);
+        set_params(tensor, false);
         return initialize_params();
     }
 
     size_t n_params() override { return network_->get_network()->get_weights_matrices().nelements(); }
     size_t n_output_dims() override { return network_->get_network()->get_output_width(); }
 
-    void set_params(torch::Tensor &params) {
+    void set_params(torch::Tensor &params, bool weights_are_packed) override {
         int network_param_size = network_->get_network()->get_weights_matrices().nelements();
         int encoding_param_size = network_->get_encoding()->n_params();
         if (encoding_param_size) {
             torch::Tensor network_params = params.slice(0, 0, network_param_size);
             torch::Tensor encoding_params =
                 params.slice(0, network_param_size, network_param_size + encoding_param_size);
-            network_->get_network()->set_weights_matrices(convertTensorToVector<T_net>(params));
+            network_->get_network()->set_weights_matrices(convertTensorToVector<T_net>(params), weights_are_packed);
             network_->set_encoding_params(convertTensorToVector<T_enc>(encoding_params));
         } else {
-            network_->get_network()->set_weights_matrices(convertTensorToVector<T_net>(params));
+            network_->get_network()->set_weights_matrices(convertTensorToVector<T_net>(params), weights_are_packed);
         }
     }
 
@@ -817,10 +839,10 @@ template <typename T_enc, typename T_net, int WIDTH> class NetworkWithEncodingMo
         auto [network_params, encoding_params] =
             slice_and_convert_params(all_params_vec, network_param_size, encoding_param_size);
         if (encoding_param_size) {
-            network_->get_network()->set_weights_matrices(network_params);
+            network_->get_network()->set_weights_matrices(network_params, false);
             network_->set_encoding_params(encoding_params);
         } else {
-            network_->get_network()->set_weights_matrices(network_params);
+            network_->get_network()->set_weights_matrices(network_params, false);
         }
     }
 
